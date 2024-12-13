@@ -1,3 +1,4 @@
+import sqlite3
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
@@ -8,9 +9,6 @@ from threading import Thread
 from queue import Queue
 import traceback
 import google.generativeai as genai
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.by import By
 import time
 import requests
 from bs4 import BeautifulSoup
@@ -18,13 +16,14 @@ import json
 from flask import Flask, jsonify
 from threading import Thread
 from typing import Dict, List, Any
+from flask_cors import CORS
+import feedparser
+import os
 
 app = Flask(__name__)
+CORS(app)
 
-def setup_undetected_driver():
-    options = webdriver.ChromeOptions()
-    options.add_argument("start-maximized")
-    return uc.Chrome(options=options)
+DB_PATH = 'crypto_news.db'
 
 # Global variables for status tracking
 scraping_status = {
@@ -42,348 +41,374 @@ scraping_status = {
     }
 }
 
-scraped_content = []
-analyzed_content = []
+def init_db():
+    """Initialize the SQLite database with required tables"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    
+    # Create articles table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS articles (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            url TEXT UNIQUE NOT NULL,
+            date TEXT NOT NULL,
+            content TEXT NOT NULL,
+            source TEXT NOT NULL,
+            image_url TEXT,
+            summary TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Create coin_analysis table
+    c.execute('''
+        CREATE TABLE IF NOT EXISTS coin_analysis (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            article_id INTEGER NOT NULL,
+            coin TEXT NOT NULL,
+            market_impact TEXT NOT NULL,
+            FOREIGN KEY (article_id) REFERENCES articles (id) ON DELETE CASCADE,
+            UNIQUE(article_id, coin)
+        )
+    ''')
+    
+    conn.commit()
+    conn.close()
 
-# [Keep all the existing helper functions: setup_regular_driver, setup_undetected_driver, 
-# parse_time, parse_time_to_minutes, analyze_market_sentiment, get_impact_magnitude, 
-# identify_affected_coins - exactly as they are in your original code]
+def store_analyzed_article(article: dict) -> bool:
+    """Store an analyzed article and its coin analysis in the database"""
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    success = False
+    
+    try:
+        # Check if article already exists
+        c.execute('SELECT id FROM articles WHERE url = ?', (article['url'],))
+        existing = c.fetchone()
+        
+        if existing:
+            print(f"Article already exists: {article['title']}")
+            return False
+        
+        # Insert article
+        c.execute('''
+            INSERT INTO articles 
+            (title, url, date, content, source, image_url, summary)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        ''', (
+            article['title'],
+            article['url'],
+            article['date'],
+            article['content'],
+            article['source'],
+            article.get('image_url', ''),
+            article.get('summary', '')
+        ))
+        
+        article_id = c.lastrowid
+        
+        # Insert coin analysis
+        if 'coin_analysis' in article:
+            for coin_data in article['coin_analysis'].values():
+                c.execute('''
+                    INSERT INTO coin_analysis 
+                    (article_id, coin, market_impact)
+                    VALUES (?, ?, ?)
+                ''', (
+                    article_id,
+                    coin_data['coin'],
+                    coin_data['market_impact']
+                ))
+        
+        conn.commit()
+        success = True
+        
+    except Exception as e:
+        print(f"Error storing article in database: {str(e)}")
+        conn.rollback()
+    finally:
+        conn.close()
+        return success
 
+def get_stored_articles(limit: int = 50) -> List[Dict]:
+    """Retrieve stored articles from the database"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    
+    try:
+        c.execute('''
+            SELECT 
+                a.*, 
+                GROUP_CONCAT(ca.coin || ':' || ca.market_impact) as coin_impacts
+            FROM articles a
+            LEFT JOIN coin_analysis ca ON a.id = ca.article_id
+            GROUP BY a.id
+            ORDER BY a.created_at DESC
+            LIMIT ?
+        ''', (limit,))
+        
+        rows = c.fetchall()
+        articles = []
+        
+        for row in rows:
+            article = dict(row)
+            
+            # Convert coin_impacts string to coin_analysis dict
+            coin_analysis = {}
+            if article['coin_impacts']:
+                for impact in article['coin_impacts'].split(','):
+                    coin, market_impact = impact.split(':')
+                    coin_analysis[coin] = {
+                        "coin": coin,
+                        "market_impact": market_impact
+                    }
+            
+            # Remove the temporary coin_impacts field
+            del article['coin_impacts']
+            article['coin_analysis'] = coin_analysis
+            articles.append(article)
+        
+        return articles
+        
+    finally:
+        conn.close()
+
+def setup_headless_driver():
+    """Setup Chrome in headless mode"""
+    chrome_options = webdriver.ChromeOptions()
+    chrome_options.add_argument('--headless=new')
+    chrome_options.add_argument('--disable-gpu')
+    chrome_options.add_argument('--no-sandbox')
+    chrome_options.add_argument('--disable-dev-shm-usage')
+    return webdriver.Chrome(options=chrome_options)
 
 def website1():
-    global scraping_status
-    driver = setup_undetected_driver()
-    wait = WebDriverWait(driver, 20)
+    """Scrapes CoinTelegraph news"""
     try:
         article_data = []
         
-        driver.get("https://cointelegraph.com/")
-        time.sleep(3)
-
-        # Scroll to load more content
-        for _ in range(3):
-            driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-            time.sleep(2)
-
-        # Get all URLs first
-        url_elements = wait.until(EC.presence_of_all_elements_located((
-            By.CSS_SELECTOR,
-            'header[data-testid="post-card-header"] > a'
-        )))
+        rss_url = "https://cointelegraph.com/rss"
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
         
-        urls = [url.get_attribute('href') for url in url_elements]
-        print("\nInitial URLs found:", len(urls))
-        
-        # Get all dates
-        date_elements = wait.until(EC.presence_of_all_elements_located((
-            By.CSS_SELECTOR,
-            'time[data-testid="post-card-published-date"]'
-        )))
-        dates = [date.text for date in date_elements]
-
-        # Get all titles from main page
-        title_elements = wait.until(EC.presence_of_all_elements_located((
-            By.CSS_SELECTOR,
-            'span[data-testid="post-card-title"]'
-        )))
-        titles = [title.text for title in title_elements]
-
-        # Filter current news
+        response = requests.get(rss_url, headers=headers)
+        if response.status_code != 200:
+            raise Exception(f"RSS request failed with status code: {response.status_code}")
+            
+        feed = feedparser.parse(response.content)
         current_date = datetime.now()
         yesterday = current_date - timedelta(days=1)
         
         filtered_data = []
-        for url, date, title in zip(urls, dates, titles):
-            # Keep all relative time stamps (containing 'ago')
-            if 'ago' in date.lower():
-                filtered_data.append((date, url, title))
-                continue
+        for item in feed.entries:
+            pub_date = datetime.strptime(item.published, '%a, %d %b %Y %H:%M:%S %z')
+            pub_date = pub_date.replace(tzinfo=None)
+            
+            if pub_date.date() >= yesterday.date():
+                image_url = None
+                if hasattr(item, 'media_content'):
+                    image_url = item.media_content[0]['url']
                 
-            # Parse the date string
-            try:
-                article_date = datetime.strptime(date, '%b %d, %Y')
-                # Keep if date is today or yesterday
-                if article_date.date() >= yesterday.date():
-                    filtered_data.append((date, url, title))
-            except ValueError:
-                continue
-
-        # Print filtered data
-        print("\n=== Filtered Articles to Process ===")
-        print(f"Total filtered articles: {len(filtered_data)}")
-        print("-" * 100)
-        for date, url, title in filtered_data:
-            print(f"Date: {date}")
-            print(f"Title: {title}")
-            print(f"URL: {url}")
-            print("-" * 100)
-
-        # Update status with filtered count
-        scraping_status["total_urls"] = len(filtered_data)
-        scraping_status["processed_urls"] = 0
+                filtered_data.append({
+                    'date': pub_date.strftime('%b %d, %Y'),
+                    'url': item.link,
+                    'title': item.title,
+                    'image_url': image_url
+                })
         
-        for date, url, main_title in filtered_data:
+        for article in filtered_data:
             try:
-                scraping_status["current_url"] = url
-                scraping_status["processed_urls"] += 1
-                print(f"\nProcessing ({scraping_status['processed_urls']}/{scraping_status['total_urls']}): {main_title}")
-                
-                driver.get(url)
-                time.sleep(2)
-                
-                content = wait.until(EC.presence_of_all_elements_located((
-                    By.CSS_SELECTOR,
-                    '.post-content p, .post-content-wrapper p, .post_block p'
-                )))
-                
-                article_text = '\n'.join([p.text for p in content if p.text.strip()])
-                
-                article_info = {
-                    'title': main_title,
-                    'url': url,
-                    'date': date,
-                    'content': article_text
-                }
-                article_data.append(article_info)
-                
-                print(f"✓ Successfully processed: {main_title}")
-                
-            except Exception as e:
-                print(f"✗ Error processing URL - {url}: {str(e)}")
-                continue
-                
-    except Exception as e:
-        print(f"Main error: {str(e)}")
-    
-    finally:
-        driver.quit()
-        
-    return article_data
-
-
-def website3():
-    import time
-    import json
-    from datetime import datetime, timedelta
-    genai.configure(api_key="AIzaSyAyQ4DGoHTIDWgfUE5qXl8FNYgBS3hMG_g")
-
-    model = genai.GenerativeModel(model_name="gemini-1.5-flash")
-    driver = setup_undetected_driver()
-    wait = WebDriverWait(driver, 10)
-    driver.get("https://www.theblock.co/")
-    time.sleep(3)  # Wait for initial page load
-
-    # First collect all dates and their associated articles from the main page
-    print("\n=== Collecting All Dates and Articles ===")
-    initial_articles = []
-    try:
-        # Find all elements with the specific data-v attribute
-        date_elements = driver.find_elements(
-            By.CSS_SELECTOR, 'div[data-v-76acefb5].meta__wrapper'
-        )
-        for element in date_elements:
-            try:
-                date_text = element.text.strip()
-                if not date_text:  # Skip empty dates
+                article_response = requests.get(article['url'], headers=headers)
+                if article_response.status_code != 200:
                     continue
                     
-                # Get the parent article element
-                parent_article = element.find_element(By.XPATH, "ancestor::article")
+                soup = BeautifulSoup(article_response.text, 'html.parser')
+                content_elements = soup.select('.post-content p')
+                article_text = '\n'.join([p.get_text().strip() for p in content_elements if p.get_text().strip()])
                 
-                # Try to get title from both possible headline classes
-                try:
-                    title = parent_article.find_element(By.CLASS_NAME, 'articleCard__headline').text
-                except:
-                    try:
-                        title = parent_article.find_element(By.CLASS_NAME, 'textCard__headline').text
-                    except:
-                        continue
-                
-                # Get URL from the article
-                url = parent_article.find_element(By.TAG_NAME, 'a').get_attribute('href')
-                
-                article_data = {
-                    'title': title,
-                    'date': date_text,
-                    'url': url
-                }
-                
-                print(f"Found article: {title}")
-                print(f"Date: {date_text}")
-                print(f"URL: {url}")
-                print("-" * 40)
-                
-                if article_data not in initial_articles:
-                    initial_articles.append(article_data)
+                if article_text:
+                    article_info = {
+                        'title': article['title'],
+                        'url': article['url'],
+                        'date': article['date'],
+                        'content': article_text,
+                        'image_url': article['image_url'],
+                        'source': 'CoinTelegraph'
+                    }
+                    article_data.append(article_info)
+                time.sleep(1)
                 
             except Exception as e:
+                print(f"Error processing URL - {article['url']}: {str(e)}")
                 continue
                 
+        return article_data
+                
     except Exception as e:
-        print(f"Error collecting initial articles: {str(e)}")
+        print(f"Error in CoinTelegraph scraping: {str(e)}")
+        return []
 
-    current_date = datetime.now()
-    yesterday = current_date - timedelta(days=1)
-    
-    filtered_articles = []
-    for article in initial_articles:
-        try:
-            # Extract date from article's date_text (e.g., "DEC 08, 2024, 1:44PM EST • COMPANIES")
-            date_parts = article['date'].split(',')  # Split by comma
-            month_day = date_parts[0].strip()  # "DEC 08"
-            year = date_parts[1].strip()  # "2024"
-            time_part = date_parts[2].split('•')[0].strip()  # "1:44PM EST"
-            
-            # Combine into proper date string
-            date_str = f"{month_day}, {year}"
-            article_date = datetime.strptime(date_str, '%b %d, %Y')
-            
-            # Check if article is from today or yesterday
-            if (article_date.date() == current_date.date() or 
-                article_date.date() == yesterday.date()):
-                filtered_articles.append(article)
-                print(f"Keeping article from {date_str}")
-            
-        except Exception as e:
-            continue
+def website10():
+    """Scrapes TheDefiant news"""
+    try:
+        rss_url = "https://thedefiant.io/api/feed"
+        article_data = []
+        
+        print("\n=== Collecting Articles from TheDefiant ===")
+        
+        feed = feedparser.parse(rss_url)
+        current_date = datetime.now()
+        yesterday = current_date - timedelta(days=1)
+        
+        filtered_data = []
+        for entry in feed.entries:
+            try:
+                pub_date = datetime.strptime(entry.published, '%a, %d %b %Y %H:%M:%S %Z')
+                if pub_date.replace(tzinfo=None) >= yesterday:
+                    content = entry.content[0].value if hasattr(entry, 'content') else entry.summary
+                    image_url = entry.media_thumbnail[0]['url'] if hasattr(entry, 'media_thumbnail') else None
+                    
+                    filtered_data.append({
+                        'date': pub_date.strftime('%b %d, %Y'),
+                        'url': entry.link,
+                        'title': entry.title,
+                        'content': content,
+                        'image_url': image_url,
+                        'source': 'TheDefiant'
+                    })
+            except ValueError:
+                continue
+        
+        print(f"Found {len(filtered_data)} recent articles from TheDefiant")
+        print(json.dumps(filtered_data, indent=2))
+        return filtered_data
+        
+    except Exception as e:
+        print(f"Error in TheDefiant scraping: {str(e)}")
+        return []
 
-    # Replace initial_articles with filtered ones
-    initial_articles = filtered_articles
+def website11():
+    """Scrapes Protos news using headless Selenium"""
+    driver = setup_headless_driver()
+    wait = WebDriverWait(driver, 20)
+    driver.get("https://protos.com/")
+    time.sleep(3)
 
-    def extract_article_content(url):
-        try:
-            driver.get(url)
-            time.sleep(2)  # Wait for content to load
-            
-            content = []
-            
-            # Get the main article container
-            article_container = wait.until(EC.presence_of_element_located((
-                By.CLASS_NAME, 'articleBody'
-            )))
-            
-            # Try different selectors for text content
-            selectors = [
-                'span[data-v-c5594f84]',
-                'span[data-v]',
-                'p[data-v] span',
-                '.articleContent span',
-                '.articleBody p'
-            ]
-            
-            for selector in selectors:
-                elements = article_container.find_elements(By.CSS_SELECTOR, selector)
-                for elem in elements:
-                    text = elem.text.strip()
-                    if (text and 
-                        text != '=' and 
-                        not text.startswith('—') and 
-                        not 'Disclaimer' in text and 
-                        not '@theblock.co' in text and 
-                        not 'To contact' in text and
-                        not '© 2024' in text and
-                        not 'The Block' in text and
-                        not 'Image:' in text and
-                        not 'Illustration by' in text):
-                        content.append(text)
-            
-            unique_content = []
-            seen = set()
-            for text in content:
-                if text not in seen:
-                    unique_content.append(text)
-                    seen.add(text)
-            
-            return ' '.join(unique_content) if unique_content else "No content found."
-            
-        except Exception as e:
-            print(f"Error extracting content from {url}: {str(e)}")
-            return "Error extracting content."
+    today = datetime.now()
+    yesterday = today - timedelta(days=1)
+    target_date = yesterday.strftime("%b %d, %Y")
+    filtered_data = []
 
     try:
-        def convert_to_24hr(time_str):
-            hour_str, period = time_str.split(":")
-            hour = int(hour_str)
-            minutes = int(period[:-2])
-            period = period[-2:]
-            
-            if period == "PM" and hour != 12:
-                hour += 12
-            elif period == "AM" and hour == 12:
-                hour = 0
-                
-            return hour * 60 + minutes
-
-        latest_minutes = -1
-        latest_article = None
-        articles_data = []
-
-        # Process all collected articles
-        print("\n=== Processing Articles Content ===")
-        for article in initial_articles:
+        articles = wait.until(EC.presence_of_all_elements_located((
+            By.CSS_SELECTOR, 'article.b-container__main'
+        )))
+        seen_titles = set()
+        
+        for article in articles:
             try:
-                content = extract_article_content(article['url'])
-                article_info = {
-                    'title': article['title'],
-                    'date': article['date'],
-                    'url': article['url'],
-                    'content': content
-                }
-                articles_data.append(article_info)
+                time_element = article.find_element(By.CSS_SELECTOR, 'div.s-links-2 time')
+                title_element = article.find_element(By.CSS_SELECTOR, 'h1.u-heading-1 a')
                 
-                # Update latest article
-                try:
-                    time_str = article['date'].split(", ")[1].split(" ")[0]
-                    minutes = convert_to_24hr(time_str)
-                    if minutes > latest_minutes:
-                        latest_minutes = minutes
-                        latest_article = article
-                except:
-                    continue
+                datetime_text = time_element.text if time_element else None
+                title_text = title_element.text if title_element else None
+                url = title_element.get_attribute('href')
+                article_date = datetime_text.split('•')[1].strip() if datetime_text else None
+                
+                if article_date == target_date and title_text and title_text not in seen_titles:
+                    seen_titles.add(title_text)
+                    driver.get(url)
+                    time.sleep(2)
+                    
+                    content_elements = driver.find_elements(By.CSS_SELECTOR, 'div.s-single p')
+                    content = ' '.join([p.text for p in content_elements if p.text.strip()])
+                    
+                    try:
+                        image_element = driver.find_element(By.CSS_SELECTOR, 'img.wp-post-image')
+                        srcset = image_element.get_attribute('srcset')
+                        if srcset:
+                            srcset_pairs = [pair.strip().split(' ') for pair in srcset.split(',')]
+                            largest_image = max(srcset_pairs, key=lambda x: int(x[1].replace('w', '')))
+                            image_url = largest_image[0]
+                        else:
+                            image_url = image_element.get_attribute('src')
+                    except:
+                        image_url = None
+                    
+                    filtered_data.append({
+                        'date': article_date,
+                        'url': url,
+                        'title': title_text,
+                        'content': content,
+                        'image_url': image_url,
+                        'source': 'Protos'
+                    })
+                    
+                    driver.back()
+                    time.sleep(2)
                     
             except Exception as e:
                 print(f"Error processing article: {str(e)}")
                 continue
-
-        # Print JSON output before AI analysis
-        print("\n=== Articles JSON Data ===")
-        json_output = json.dumps(articles_data, indent=2)
-        print(json_output)
-        
-        print("\n=== AI ANALYSIS ===\n")
-        
-        for article in articles_data:
-            prompt = f"""
-            First provide a 2-3 sentence summary of this crypto news article, then analyze potential market impact on major cryptocurrencies (BTC, ETH, SOL, XRP, etc.) in a concise bullet format:
-            
-            Title: {article['title']}
-            Content: {article['content']}
-            
-            Format response as:
-            SUMMARY: [2-3 sentence summary]
-            
-            POTENTIAL MARKET IMPACT:
-            - [coin]: [predicted movement with brief reason]
-            """
-            
-            response = model.generate_content(prompt)
-            print(f"Analysis for: {article['title']}")
-            print(f"Date: {article['date']}")
-            print(f"{response.text}")
-            print("-" * 80)
-        
+                
     except Exception as e:
-        print(f"Error: {str(e)}")
+        print(f"Main error: {str(e)}")
     finally:
         driver.quit()
-        
-    return articles_data
 
+    print(f"Found {len(filtered_data)} recent articles from Protos")
+    print(json.dumps(filtered_data, indent=2))
+    return filtered_data
+
+def is_market_significant_news(title: str, content: str, model) -> bool:
+    """Uses Gemini to determine if a crypto news article has significant market impact"""
+    prompt = f"""
+    Analyze this crypto news article and determine if it has significant market impact.
+    Only respond with "y" if ALL of these criteria are met:
+    1. The news is directly related to cryptocurrency or blockchain
+    2. The news could affect market prices or trading behavior
+    3. The impact is significant (e.g. involves major amounts >$10M, affects major protocols/exchanges, regulatory changes)
+    4. The news affects the broader crypto market, not just individual small incidents
+    
+    Respond with "n" if the news:
+    - Only affects individual users or small amounts
+    - Is about minor scams or personal losses
+    - Is primarily educational or informational
+    - Has minimal broader market impact
+    - Is about minor technical updates or small projects
+    
+    Only reply with "y" or "n" - no other explanation.
+    
+    Title: {title}
+    Content: {content}
+    """
+    
+    max_retries = 3
+    base_delay = 60
+    
+    for attempt in range(max_retries):
+        try:
+            response = model.generate_content(prompt)
+            return response.text.strip().lower() == 'y'
+        except Exception as e:
+            if "429" in str(e) and attempt < max_retries - 1:
+                wait_time = base_delay * (attempt + 1)
+                print(f"\nRate limit reached. Waiting {wait_time} seconds...")
+                time.sleep(wait_time)
+                continue
+            else:
+                print(f"Error checking market significance: {str(e)}")
+                return True
+    
+    return True
 
 def analyze_market_sentiment(text: str) -> str:
-    """Helper function to analyze text sentiment"""
+    """Analyzes text sentiment for market impact"""
     positive_words = {'surge', 'jump', 'gain', 'rally', 'bull', 'upward', 'high', 'profit', 'success', 'grow', 'boost'}
-    negative_words = {'drop', 'fall', 'decline', 'crash', 'bear', 'down', 'loss', 'risk', 'warning', 'trouble', 'concern'}
+    negative_words = {'drop', 'fall', 'decline', 'crash', 'bear', 'down', 'loss', 'risk', 'warning', 'trouble'}
     
     text_lower = text.lower()
     positive_count = sum(1 for word in positive_words if word in text_lower)
@@ -395,39 +420,50 @@ def analyze_market_sentiment(text: str) -> str:
         return "decrease"
     return "stable"
 
+import re
 def get_impact_magnitude(context: str) -> str:
-    """Helper function to determine impact magnitude"""
+    """Determines impact magnitude of news"""
     strong_words = {'massive', 'huge', 'significant', 'substantial', 'dramatic', 'major'}
-    moderate_words = {'modest', 'moderate', 'slight', 'small', 'minor'}
+    moderate_words = {'modest', 'moderate', 'slight', 'small', 'minor', 'limited'}
     
     context_lower = context.lower()
+    
+    amount_pattern = r'\$(\d+(?:\.\d+)?)\s*(?:million|billion|trillion|M|B|T)'
+    matches = re.findall(amount_pattern, context)
+    
+    if matches:
+        for amount in matches:
+            try:
+                value = float(amount)
+                if value > 100:
+                    return "strongly"
+                elif value > 10:
+                    return "moderately"
+            except ValueError:
+                continue
+    
     for word in strong_words:
         if word in context_lower:
             return "strongly"
     for word in moderate_words:
         if word in context_lower:
             return "slightly"
+    
     return "moderately"
 
-
 def identify_affected_coins(text: str) -> Dict[str, Dict[str, str]]:
-    """Helper function to identify coins and their market impact"""
+    """Identifies coins and their market impact"""
     crypto_keywords = {
         'Bitcoin': 'BTC',
         'Ethereum': 'ETH',
         'Cardano': 'ADA',
-        'Dogecoin': 'DOGE',
-        'Pepe': 'PEPE',
-        'Fantom': 'FTM',
-        'Sui': 'SUI',
         'Binance': 'BNB',
         'Solana': 'SOL',
         'Ripple': 'XRP',
         'Polygon': 'MATIC',
         'Chainlink': 'LINK',
         'Avalanche': 'AVAX',
-        'Polkadot': 'DOT',
-        'Litecoin': 'LTC'
+        'Polkadot': 'DOT'
     }
     
     affected_coins = {}
@@ -450,65 +486,71 @@ def identify_affected_coins(text: str) -> Dict[str, Dict[str, str]]:
     return affected_coins
 
 def combine_crypto_news():
-    """Combines news from both sources and formats them consistently"""
+    """Combines and filters news from all sources"""
+    filtered_articles = []
+    
+    # Configure Gemini
+    genai.configure(api_key="AIzaSyAyQ4DGoHTIDWgfUE5qXl8FNYgBS3hMG_g")  # Replace with your API key
+    model = genai.GenerativeModel(model_name="gemini-1.5-flash")
+    
+    # Fetch CoinTelegraph News
     try:
-        # Get data from both sources
         print("\n=== Fetching CoinTelegraph News ===")
         cointelegraph_data = website1()
+        print(f"Successfully fetched {len(cointelegraph_data)} articles from CoinTelegraph")
         
-        print("\n=== Fetching TheBlock News ===")
-        theblock_data = website3()
-        
-        # Combine and standardize the data
-        combined_articles = []
-        
-        # Process CoinTelegraph articles
         for article in cointelegraph_data:
-            standardized_article = {
-                'title': article['title'],
-                'date': article['date'],
-                'url': article['url'],
-                'content': article['content'],
-                'source': 'CoinTelegraph'
-            }
-            combined_articles.append(standardized_article)
-        
-        # Process TheBlock articles
-        for article in theblock_data:
-            standardized_article = {
-                'title': article['title'],
-                'date': article['date'],
-                'url': article['url'],
-                'content': article['content'],
-                'source': 'TheBlock'
-            }
-            combined_articles.append(standardized_article)
-        
-        # Output combined JSON data
-        print("\n=== Combined Crypto News Data ===")
-        print(f"Total articles: {len(combined_articles)}")
-        print(f"CoinTelegraph articles: {len(cointelegraph_data)}")
-        print(f"TheBlock articles: {len(theblock_data)}")
-        
-        json_output = json.dumps(combined_articles, indent=2)
-        print("\nJSON Output:")
-        print(json_output)
-        
-        return combined_articles
-        
+            if is_market_significant_news(article['title'], article['content'], model):
+                filtered_articles.append(article)
+            else:
+                print(f"Filtered out low-impact article from CoinTelegraph: {article['title']}")
+    
     except Exception as e:
-        print(f"Error combining crypto news: {str(e)}")
-        return []
+        print(f"Error processing CoinTelegraph news: {str(e)}")
+    
+    # Fetch Protos News
+    try:
+        print("\n=== Fetching Protos News ===")
+        protos_data = website11()
+        print(f"Successfully fetched {len(protos_data)} articles from Protos")
+        
+        for article in protos_data:
+            if is_market_significant_news(article['title'], article['content'], model):
+                filtered_articles.append(article)
+            else:
+                print(f"Filtered out low-impact article from Protos: {article['title']}")
+    
+    except Exception as e:
+        print(f"Error processing Protos news: {str(e)}")
+    
+    # Fetch TheDefiant News
+    try:
+        print("\n=== Fetching TheDefiant News ===")
+        thedefiant_data = website10()
+        print(f"Successfully fetched {len(thedefiant_data)} articles from TheDefiant")
+        
+        for article in thedefiant_data:
+            if is_market_significant_news(article['title'], article['content'], model):
+                filtered_articles.append(article)
+            else:
+                print(f"Filtered out low-impact article from TheDefiant: {article['title']}")
+            
+    except Exception as e:
+        print(f"Error processing TheDefiant news: {str(e)}")
+    
+    print(f"\nTotal market-significant articles after filtering: {len(filtered_articles)}")
+    print("\n====== Combined JSON Output ======\n")
+    print(json.dumps(filtered_articles, indent=2))
+    
+    return filtered_articles
 
 def analyze_combined_news(articles):
     """Analyzes the combined news articles using Gemini API"""
     global scraping_status
-    
     analyzed_results = []
     
     try:
-        # Configure Gemini
-        genai.configure(api_key="AIzaSyAyQ4DGoHTIDWgfUE5qXl8FNYgBS3hMG_g")
+        genai.configure(api_key="AIzaSyAOTr-EJIgfj3vbQWZJ5QvoyAsgJaBL4ak")
         model = genai.GenerativeModel(model_name="gemini-1.5-flash")
         
         total_articles = len(articles)
@@ -518,23 +560,35 @@ def analyze_combined_news(articles):
         
         for idx, article in enumerate(articles, 1):
             try:
-                # Update status
                 scraping_status["ai_analysis"]["current_article"] = article["title"]
                 scraping_status["ai_analysis"]["processed_articles"] = idx
                 
-                # Get coin analysis
-                full_text = f"{article['title']} {article['content']}"
-                coin_analysis = identify_affected_coins(full_text)
-                
-                # Get summary
-                prompt = f"""
-                Provide a concise 2-3 sentence summary of this crypto news article:
+                analysis_prompt = f"""
+                Provide a concise but comprehensive analysis of this crypto news article.
+                Focus on market impact, potential price effects, and broader implications.
+                Limit response to 3-4 sentences.
                 
                 Title: {article['title']}
                 Content: {article['content']}
                 """
                 
-                response = model.generate_content(prompt)
+                max_retries = 3
+                base_delay = 60
+                
+                for attempt in range(max_retries):
+                    try:
+                        response = model.generate_content(analysis_prompt)
+                        break
+                    except Exception as e:
+                        if "429" in str(e) and attempt < max_retries - 1:
+                            wait_time = base_delay * (attempt + 1)
+                            print(f"\nRate limit reached. Waiting {wait_time} seconds...")
+                            time.sleep(wait_time)
+                            continue
+                        raise e
+                
+                full_text = f"{article['title']} {article['content']}"
+                coin_analysis = identify_affected_coins(full_text)
                 
                 analyzed_article = {
                     'title': article['title'],
@@ -542,20 +596,21 @@ def analyze_combined_news(articles):
                     'date': article['date'],
                     'content': article['content'],
                     'source': article['source'],
+                    'image_url': article.get('image_url', ''),
                     'summary': response.text,
                     'coin_analysis': coin_analysis
                 }
                 
-                analyzed_results.append(analyzed_article)
+                if store_analyzed_article(analyzed_article):
+                    analyzed_results.append(analyzed_article)
                 
                 print(f"\nAnalyzed article {idx}/{total_articles}")
                 print(f"Source: {article['source']}")
                 print(f"Title: {article['title']}")
-                print(f"Summary: {response.text}")
                 print("Coin Analysis:", json.dumps(coin_analysis, indent=2))
                 print("-" * 80)
                 
-                time.sleep(1)  # Rate limiting
+                time.sleep(2)
                 
             except Exception as e:
                 print(f"Error analyzing article '{article['title']}': {str(e)}")
@@ -569,28 +624,24 @@ def analyze_combined_news(articles):
 
 def combined_scraping_task():
     """Main task that coordinates scraping and analysis"""
-    global scraping_status, scraped_content, analyzed_content
+    global scraping_status
     
     scraping_status["is_running"] = True
     scraping_status["completed"] = False
+    scraping_status["ai_analysis"]["is_running"] = False
+    scraping_status["ai_analysis"]["completed"] = False
     
     try:
-        # Get combined news
         print("Starting combined news collection...")
         combined_articles = combine_crypto_news()
-        scraped_content = combined_articles
         
-        # Update scraping status
         scraping_status["total_urls"] = len(combined_articles)
         scraping_status["processed_urls"] = len(combined_articles)
         scraping_status["completed"] = True
         
-        # Start analysis
         print("Starting combined news analysis...")
         scraping_status["ai_analysis"]["is_running"] = True
         analyzed_content = analyze_combined_news(combined_articles)
-        
-        # Update analysis status
         scraping_status["ai_analysis"]["completed"] = True
         
     except Exception as e:
@@ -602,6 +653,7 @@ def combined_scraping_task():
 # Flask Routes
 @app.route('/crypto/start')
 def start_combined_scraping():
+    """Start the scraping process"""
     global scraping_status
     
     if scraping_status["is_running"]:
@@ -619,8 +671,8 @@ def start_combined_scraping():
         "current_article": ""
     }
     
-    # Start combined scraping in a thread
     thread = Thread(target=combined_scraping_task)
+    thread.daemon = True
     thread.start()
     
     return jsonify({
@@ -630,6 +682,7 @@ def start_combined_scraping():
 
 @app.route('/crypto/status')
 def get_combined_status():
+    """Get current scraping status"""
     return jsonify({
         'status': 'success',
         'data': {
@@ -644,79 +697,113 @@ def get_combined_status():
         }
     })
 
-@app.route('/crypto/content')
-def get_combined_content():
-    if scraping_status["is_running"]:
-        return jsonify({
-            'status': 'pending',
-            'message': 'Scraping is still in progress'
-        })
-    
-    if not scraping_status["completed"]:
-        return jsonify({
-            'status': 'error',
-            'message': 'No scraping has been performed yet'
-        })
-    
-    if scraping_status["ai_analysis"]["completed"]:
-        return jsonify({
-            'status': 'success',
-            'data': analyzed_content
-        })
-    elif scraping_status["ai_analysis"]["is_running"]:
-        return jsonify({
-            'status': 'pending',
-            'message': 'AI analysis in progress',
-            'data': scraped_content
-        })
-    else:
-        return jsonify({
-            'status': 'success',
-            'data': scraped_content
-        })
-
 @app.route('/crypto/summary')
 def get_combined_summary():
-    if scraping_status["is_running"]:
+    """Get analyzed articles from database"""
+    if scraping_status["ai_analysis"]["is_running"]:
         return jsonify({
             'status': 'pending',
-            'message': 'Scraping is still in progress'
+            'message': 'AI analysis in progress'
         })
     
-    if not scraping_status["completed"]:
+    stored_articles = get_stored_articles()
+    
+    if not stored_articles:
         return jsonify({
             'status': 'error',
-            'message': 'No scraping has been performed yet'
+            'message': 'No analyzed articles found in database'
         })
-    
-    if not scraping_status["ai_analysis"]["completed"]:
-        if scraping_status["ai_analysis"]["is_running"]:
-            return jsonify({
-                'status': 'pending',
-                'message': 'AI analysis in progress'
-            })
-        return jsonify({
-            'status': 'error',
-            'message': 'AI analysis has not been performed'
-        })
-    
-    # Format summary data
-    summary_data = [
-        {
-            'title': article['title'],
-            'url': article['url'],
-            'date': article['date'],
-            'source': article['source'],
-            'summary': article['summary'],
-            'coin_analysis': article['coin_analysis']
-        }
-        for article in analyzed_content
-    ]
     
     return jsonify({
         'status': 'success',
-        'data': summary_data
+        'data': stored_articles
     })
 
+@app.route('/crypto/<coin>')
+def get_coin_stats(coin):
+    """Get 7-day statistics for a specific coin from analyzed articles"""
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    c = conn.cursor()
+    
+    try:
+        # Calculate date 7 days ago
+        seven_days_ago = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
+        
+        # Get all impact analysis for the specified coin within last 7 days
+        c.execute('''
+            SELECT 
+                a.date,
+                ca.market_impact,
+                COUNT(*) as count
+            FROM articles a
+            JOIN coin_analysis ca ON a.id = ca.article_id
+            WHERE ca.coin = ?
+            AND date(a.created_at) >= date(?)
+            GROUP BY a.date, ca.market_impact
+            ORDER BY a.date DESC
+        ''', (coin.upper(), seven_days_ago))
+        
+        results = c.fetchall()
+        
+        if not results:
+            return jsonify({
+                'status': 'error',
+                'message': f'No analysis found for {coin.upper()} in the last 7 days'
+            })
+        
+        # Organize data by date
+        date_stats = {}
+        total_mentions = 0
+        
+        for row in results:
+            date = row['date']
+            impact = row['market_impact']
+            count = row['count']
+            total_mentions += count
+            
+            if date not in date_stats:
+                date_stats[date] = {
+                    'strongly_increase': 0,
+                    'strongly_decrease': 0,
+                    'strongly_stable': 0,
+                    'moderately_increase': 0,
+                    'moderately_decrease': 0,
+                    'moderately_stable': 0,
+                    'slightly_increase': 0,
+                    'slightly_decrease': 0,
+                    'slightly_stable': 0
+                }
+            
+            date_stats[date][impact] = count
+        
+        # Format response
+        formatted_data = {
+            'total_news_mention': total_mentions,
+            'data': {
+                date: {
+                    'date': date,
+                    'coin': coin.upper(),
+                    'market_impact': stats
+                }
+                for date, stats in date_stats.items()
+            }
+        }
+        
+        return jsonify({
+            'status': 'success',
+            'data': formatted_data
+        })
+        
+    except Exception as e:
+        return jsonify({
+            'status': 'error',
+            'message': str(e)
+        })
+    finally:
+        conn.close()
+
 if __name__ == '__main__':
-    app.run(debug=True)
+    init_db()
+    app.run(debug=True, port=8000)
+
