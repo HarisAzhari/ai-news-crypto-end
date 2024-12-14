@@ -23,8 +23,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the application code
 COPY . .
 
-# Create volume for the database
-VOLUME /app/data
+# Remove the VOLUME instruction
+# VOLUME /app/data  <-- Remove this line
 
 # Expose the port the app runs on
 EXPOSE 8000
