@@ -529,7 +529,7 @@ def combine_crypto_news():
     filtered_articles = []
     
     # Configure Gemini
-    genai.configure(api_key="YOUR_GEMINI_API_KEY")  # Replace with your API key
+    genai.configure(api_key="AIzaSyAyQ4DGoHTIDWgfUE5qXl8FNYgBS3hMG_g")  # Replace with your API key
     model = genai.GenerativeModel(model_name="gemini-1.5-flash")
     
     # Fetch CoinTelegraph News
@@ -586,7 +586,7 @@ def analyze_combined_news(articles):
     analyzed_results = []
     
     try:
-        genai.configure(api_key="YOUR_GEMINI_API_KEY")  # Replace with your API key
+        genai.configure(api_key="AIzaSyAOTr-EJIgfj3vbQWZJ5QvoyAsgJaBL4ak")  # Replace with your API key
         model = genai.GenerativeModel(model_name="gemini-1.5-flash")
         
         total_articles = len(articles)
