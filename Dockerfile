@@ -4,8 +4,10 @@ FROM python:3.11-slim
 # Set working directory
 WORKDIR /app
 
-# Install system dependencies including sqlite3
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
+    wget \
+    gnupg \
     chromium \
     chromium-driver \
     build-essential \
@@ -14,7 +16,12 @@ RUN apt-get update && apt-get install -y \
     libsqlite3-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy requirements first to leverage Docker cache
+# Set Chrome environment variables
+ENV CHROME_BIN=/usr/bin/chromium
+ENV CHROMEDRIVER_PATH=/usr/bin/chromedriver
+ENV PYTHONUNBUFFERED=1
+
+# Copy requirements first
 COPY requirements.txt .
 
 # Install Python dependencies
@@ -23,14 +30,14 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the application code
 COPY . .
 
-# Remove the VOLUME instruction
-# VOLUME /app/data  <-- Remove this line
-
-# Expose the port the app runs on
-EXPOSE 8000
+# Create and set permissions for data directory
+RUN mkdir -p /app/data && chmod 777 /app/data
 
 # Set environment variables
 ENV DB_PATH=/app/data/crypto_news.db
 
+# Expose port
+EXPOSE 8000
+
 # Command to run the application
-CMD ["python", "news-ai.py"]
+CMD ["gunicorn", "--bind", "0.0.0.0:8000", "--workers", "1", "--timeout", "120", "news-ai:app"]
