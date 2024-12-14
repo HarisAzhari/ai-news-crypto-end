@@ -1,0 +1,16 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+env
+.env
+*.db
+.git
+.gitignore
+README.md
+Dockerfile
+.dockerignore
+venv
+.venv
+data/
