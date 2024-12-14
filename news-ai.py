@@ -19,11 +19,13 @@ from typing import Dict, List, Any
 from flask_cors import CORS
 import feedparser
 import os
+from pathlib import Path
 
 app = Flask(__name__)
 CORS(app)
 
-DB_PATH = 'crypto_news.db'
+# Get the absolute path to the database file
+DB_PATH = os.environ.get('DB_PATH', 'crypto_news.db')
 
 # Global variables for status tracking
 scraping_status = {
@@ -43,137 +45,176 @@ scraping_status = {
 
 def init_db():
     """Initialize the SQLite database with required tables"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
+    # Ensure the database directory exists
+    db_dir = os.path.dirname(DB_PATH)
+    Path(db_dir).mkdir(parents=True, exist_ok=True)
     
-    # Create articles table
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS articles (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            title TEXT NOT NULL,
-            url TEXT UNIQUE NOT NULL,
-            date TEXT NOT NULL,
-            content TEXT NOT NULL,
-            source TEXT NOT NULL,
-            image_url TEXT,
-            summary TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
+    print(f"Initializing database at {DB_PATH}")
     
-    # Create coin_analysis table
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS coin_analysis (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            article_id INTEGER NOT NULL,
-            coin TEXT NOT NULL,
-            market_impact TEXT NOT NULL,
-            FOREIGN KEY (article_id) REFERENCES articles (id) ON DELETE CASCADE,
-            UNIQUE(article_id, coin)
-        )
-    ''')
-    
-    conn.commit()
-    conn.close()
+    # Connect to database and create tables
+    with sqlite3.connect(DB_PATH) as conn:
+        c = conn.cursor()
+        
+        # Create articles table
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS articles (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                title TEXT NOT NULL,
+                url TEXT UNIQUE NOT NULL,
+                date TEXT NOT NULL,
+                content TEXT NOT NULL,
+                source TEXT NOT NULL,
+                image_url TEXT,
+                summary TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        ''')
+        
+        # Create coin_analysis table
+        c.execute('''
+            CREATE TABLE IF NOT EXISTS coin_analysis (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                article_id INTEGER NOT NULL,
+                coin TEXT NOT NULL,
+                market_impact TEXT NOT NULL,
+                FOREIGN KEY (article_id) REFERENCES articles (id) ON DELETE CASCADE,
+                UNIQUE(article_id, coin)
+            )
+        ''')
+        
+        conn.commit()
+        
+        # Verify tables were created
+        c.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = c.fetchall()
+        print(f"Initialized database with tables: {[table[0] for table in tables]}")
 
 def store_analyzed_article(article: dict) -> bool:
     """Store an analyzed article and its coin analysis in the database"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    success = False
-    
     try:
-        # Check if article already exists
-        c.execute('SELECT id FROM articles WHERE url = ?', (article['url'],))
-        existing = c.fetchone()
+        # Ensure database exists
+        if not os.path.exists(DB_PATH):
+            print("Database does not exist, initializing...")
+            init_db()
+            
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        success = False
         
-        if existing:
-            print(f"Article already exists: {article['title']}")
-            return False
-        
-        # Insert article
-        c.execute('''
-            INSERT INTO articles 
-            (title, url, date, content, source, image_url, summary)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        ''', (
-            article['title'],
-            article['url'],
-            article['date'],
-            article['content'],
-            article['source'],
-            article.get('image_url', ''),
-            article.get('summary', '')
-        ))
-        
-        article_id = c.lastrowid
-        
-        # Insert coin analysis
-        if 'coin_analysis' in article:
-            for coin_data in article['coin_analysis'].values():
-                c.execute('''
-                    INSERT INTO coin_analysis 
-                    (article_id, coin, market_impact)
-                    VALUES (?, ?, ?)
-                ''', (
-                    article_id,
-                    coin_data['coin'],
-                    coin_data['market_impact']
-                ))
-        
-        conn.commit()
-        success = True
-        
+        try:
+            # Check if article already exists
+            c.execute('SELECT id FROM articles WHERE url = ?', (article['url'],))
+            existing = c.fetchone()
+            
+            if existing:
+                print(f"Article already exists: {article['title']}")
+                return False
+            
+            # Insert article
+            c.execute('''
+                INSERT INTO articles 
+                (title, url, date, content, source, image_url, summary)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''', (
+                article['title'],
+                article['url'],
+                article['date'],
+                article['content'],
+                article['source'],
+                article.get('image_url', ''),
+                article.get('summary', '')
+            ))
+            
+            article_id = c.lastrowid
+            
+            # Insert coin analysis
+            if 'coin_analysis' in article:
+                for coin_data in article['coin_analysis'].values():
+                    c.execute('''
+                        INSERT INTO coin_analysis 
+                        (article_id, coin, market_impact)
+                        VALUES (?, ?, ?)
+                    ''', (
+                        article_id,
+                        coin_data['coin'],
+                        coin_data['market_impact']
+                    ))
+            
+            conn.commit()
+            success = True
+            
+        except Exception as e:
+            print(f"Error storing article in database: {str(e)}")
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+            return success
+            
     except Exception as e:
-        print(f"Error storing article in database: {str(e)}")
-        conn.rollback()
-    finally:
-        conn.close()
-        return success
+        print(f"Critical database error: {str(e)}")
+        return False
 
 def get_stored_articles(limit: int = 50) -> List[Dict]:
     """Retrieve stored articles from the database"""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    
     try:
-        c.execute('''
-            SELECT 
-                a.*, 
-                GROUP_CONCAT(ca.coin || ':' || ca.market_impact) as coin_impacts
-            FROM articles a
-            LEFT JOIN coin_analysis ca ON a.id = ca.article_id
-            GROUP BY a.id
-            ORDER BY a.created_at DESC
-            LIMIT ?
-        ''', (limit,))
-        
-        rows = c.fetchall()
-        articles = []
-        
-        for row in rows:
-            article = dict(row)
+        # Ensure database exists
+        if not os.path.exists(DB_PATH):
+            print("Database does not exist, initializing...")
+            init_db()
+            return []
             
-            # Convert coin_impacts string to coin_analysis dict
-            coin_analysis = {}
-            if article['coin_impacts']:
-                for impact in article['coin_impacts'].split(','):
-                    coin, market_impact = impact.split(':')
-                    coin_analysis[coin] = {
-                        "coin": coin,
-                        "market_impact": market_impact
-                    }
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        
+        try:
+            c.execute('''
+                SELECT 
+                    a.*, 
+                    GROUP_CONCAT(ca.coin || ':' || ca.market_impact) as coin_impacts
+                FROM articles a
+                LEFT JOIN coin_analysis ca ON a.id = ca.article_id
+                GROUP BY a.id
+                ORDER BY a.created_at DESC
+                LIMIT ?
+            ''', (limit,))
             
-            # Remove the temporary coin_impacts field
-            del article['coin_impacts']
-            article['coin_analysis'] = coin_analysis
-            articles.append(article)
-        
-        return articles
-        
-    finally:
-        conn.close()
+            rows = c.fetchall()
+            articles = []
+            
+            for row in rows:
+                article = dict(row)
+                
+                # Convert coin_impacts string to coin_analysis dict
+                coin_analysis = {}
+                if article['coin_impacts']:
+                    for impact in article['coin_impacts'].split(','):
+                        coin, market_impact = impact.split(':')
+                        coin_analysis[coin] = {
+                            "coin": coin,
+                            "market_impact": market_impact
+                        }
+                
+                # Remove the temporary coin_impacts field
+                del article['coin_impacts']
+                article['coin_analysis'] = coin_analysis
+                articles.append(article)
+            
+            return articles
+            
+        except sqlite3.OperationalError as e:
+            print(f"Database operation failed: {str(e)}")
+            if "no such table" in str(e):
+                init_db()
+                return []
+            raise
+        finally:
+            conn.close()
+            
+    except Exception as e:
+        print(f"Critical database error: {str(e)}")
+        return []
 
 def setup_headless_driver():
     """Setup Chrome in headless mode"""
@@ -283,7 +324,6 @@ def website10():
                 continue
         
         print(f"Found {len(filtered_data)} recent articles from TheDefiant")
-        print(json.dumps(filtered_data, indent=2))
         return filtered_data
         
     except Exception as e:
@@ -360,7 +400,6 @@ def website11():
         driver.quit()
 
     print(f"Found {len(filtered_data)} recent articles from Protos")
-    print(json.dumps(filtered_data, indent=2))
     return filtered_data
 
 def is_market_significant_news(title: str, content: str, model) -> bool:
@@ -490,7 +529,7 @@ def combine_crypto_news():
     filtered_articles = []
     
     # Configure Gemini
-    genai.configure(api_key="AIzaSyAyQ4DGoHTIDWgfUE5qXl8FNYgBS3hMG_g")  # Replace with your API key
+    genai.configure(api_key="YOUR_GEMINI_API_KEY")  # Replace with your API key
     model = genai.GenerativeModel(model_name="gemini-1.5-flash")
     
     # Fetch CoinTelegraph News
@@ -539,9 +578,6 @@ def combine_crypto_news():
         print(f"Error processing TheDefiant news: {str(e)}")
     
     print(f"\nTotal market-significant articles after filtering: {len(filtered_articles)}")
-    print("\n====== Combined JSON Output ======\n")
-    print(json.dumps(filtered_articles, indent=2))
-    
     return filtered_articles
 
 def analyze_combined_news(articles):
@@ -550,7 +586,7 @@ def analyze_combined_news(articles):
     analyzed_results = []
     
     try:
-        genai.configure(api_key="AIzaSyAOTr-EJIgfj3vbQWZJ5QvoyAsgJaBL4ak")
+        genai.configure(api_key="YOUR_GEMINI_API_KEY")  # Replace with your API key
         model = genai.GenerativeModel(model_name="gemini-1.5-flash")
         
         total_articles = len(articles)
@@ -722,11 +758,17 @@ def get_combined_summary():
 @app.route('/crypto/<coin>')
 def get_coin_stats(coin):
     """Get 7-day statistics for a specific coin from analyzed articles"""
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    c = conn.cursor()
-    
     try:
+        if not os.path.exists(DB_PATH):
+            return jsonify({
+                'status': 'error',
+                'message': 'Database does not exist'
+            })
+            
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        c = conn.cursor()
+        
         # Calculate date 7 days ago
         seven_days_ago = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d')
         
@@ -801,10 +843,13 @@ def get_coin_stats(coin):
             'message': str(e)
         })
     finally:
-        conn.close()
+        if 'conn' in locals():
+            conn.close()
 
 if __name__ == '__main__':
+    print("Initializing database...")
     init_db()
+    
+    print("Starting Flask application...")
     port = int(os.environ.get('PORT', 8000))
     app.run(host='0.0.0.0', port=port)
-
